@@ -52,9 +52,40 @@ const CodeSchema = new mongoose.Schema({
     type: Boolean,
     default: false,
   },
+  reviewedBy: [
+    {
+      type: String, // email addresses
+    },
+  ],
   createdAt: {
     type: Date,
     default: Date.now,
+  },
+});
+
+const LineReviewSchema = new mongoose.Schema({
+  lineNumber: {
+    type: Number,
+    required: true,
+  },
+  comment: {
+    type: String,
+    required: true,
+  },
+  category: {
+    type: String,
+    required: true,
+    enum: [
+      "Bug/Error",
+      "Performance",
+      "Code Style",
+      "Best Practices",
+      "Security",
+      "Functionality",
+      "Debugging",
+      "Refactoring",
+      "Other",
+    ],
   },
 });
 
@@ -62,6 +93,10 @@ const ReviewSchema = new mongoose.Schema({
   codeId: {
     type: mongoose.Schema.Types.ObjectId,
     ref: "Code",
+    required: true,
+  },
+  reviewerEmail: {
+    type: String,
     required: true,
   },
   reviewerName: {
@@ -76,43 +111,47 @@ const ReviewSchema = new mongoose.Schema({
     type: String,
     required: true,
   },
-  reviewComment: {
+  generalComment: {
     type: String,
-    required: true,
+    required: false,
   },
-  category: {
-    type: String,
-    required: true,
-    enum: [
-      "Bug/Error",
-      "Performance",
-      "Code Style",
-      "Best Practices",
-      "Security",
-      "Functionality",
-      "Other",
-    ],
-  },
+  lineReviews: [LineReviewSchema],
   createdAt: {
     type: Date,
     default: Date.now,
   },
 });
 
+// Create compound index to ensure one review per user per code
+ReviewSchema.index({ codeId: 1, reviewerEmail: 1 }, { unique: true });
+
 const Code = mongoose.model("Code", CodeSchema);
 const Review = mongoose.model("Review", ReviewSchema);
 
 // Routes
-
-// Get random code for review (excluding completed ones)
+// Get random code for review (excluding completed ones and ones already reviewed by this user)
 app.get("/api/codes/random", async (req, res) => {
   try {
-    const availableCodes = await Code.find({ isCompleted: false });
+    const { email } = req.query;
 
-    if (availableCodes.length === 0) {
-      return res.status(404).json({ message: "No codes available for review" });
+    if (!email) {
+      return res.status(400).json({ error: "Email parameter is required" });
     }
 
+    // Find codes that are not completed and not reviewed by this user
+    const availableCodes = await Code.find({
+      isCompleted: false,
+      reviewedBy: { $ne: email },
+    });
+
+    if (availableCodes.length === 0) {
+      return res.status(404).json({
+        message:
+          "No codes available for review. You may have reviewed all available codes or all codes are completed.",
+      });
+    }
+
+    // Randomly select one code
     const randomIndex = Math.floor(Math.random() * availableCodes.length);
     const selectedCode = availableCodes[randomIndex];
 
@@ -128,23 +167,34 @@ app.post("/api/reviews", async (req, res) => {
   try {
     const {
       codeId,
+      reviewerEmail,
       reviewerName,
       yearsOfExperience,
       position,
-      reviewComment,
-      category,
+      generalComment,
+      lineReviews,
     } = req.body;
 
     // Validation
     if (
       !codeId ||
+      !reviewerEmail ||
       !reviewerName ||
       !yearsOfExperience ||
       !position ||
-      !reviewComment ||
-      !category
+      !lineReviews ||
+      lineReviews.length === 0
     ) {
-      return res.status(400).json({ error: "All fields are required" });
+      return res.status(400).json({
+        error:
+          "Code ID, reviewer email, name, experience, position, and at least one line review are required",
+      });
+    }
+
+    // Validate email format
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(reviewerEmail)) {
+      return res.status(400).json({ error: "Invalid email format" });
     }
 
     // Check if code exists and is not completed
@@ -154,32 +204,76 @@ app.post("/api/reviews", async (req, res) => {
     }
 
     if (code.isCompleted) {
-      return res
-        .status(400)
-        .json({ error: "This code has already been reviewed maximum times" });
+      return res.status(400).json({
+        error: "This code has already been reviewed maximum times",
+      });
+    }
+
+    // Check if user has already reviewed this code
+    if (code.reviewedBy.includes(reviewerEmail)) {
+      return res.status(400).json({
+        error: "You have already reviewed this code",
+      });
+    }
+
+    // Validate line reviews
+    for (let lineReview of lineReviews) {
+      if (
+        !lineReview.lineNumber ||
+        !lineReview.comment ||
+        !lineReview.category
+      ) {
+        return res.status(400).json({
+          error:
+            "Each line review must have line number, comment, and category",
+        });
+      }
+      if (lineReview.comment.length < 10) {
+        return res.status(400).json({
+          error: `Comment for line ${lineReview.lineNumber} must be at least 10 characters long`,
+        });
+      }
     }
 
     // Create review
     const review = new Review({
       codeId,
+      reviewerEmail,
       reviewerName,
       yearsOfExperience: parseInt(yearsOfExperience),
       position,
-      reviewComment,
-      category,
+      generalComment,
+      lineReviews,
     });
 
     await review.save();
 
-    // Update code review count
+    // Update code review count and add reviewer email
     code.reviewCount += 1;
+    code.reviewedBy.push(reviewerEmail);
+
     if (code.reviewCount >= code.maxReviews) {
       code.isCompleted = true;
     }
+
     await code.save();
 
-    res.status(201).json({ message: "Review submitted successfully", review });
+    res.status(201).json({
+      message: "Review submitted successfully",
+      review: {
+        id: review._id,
+        reviewCount: code.reviewCount,
+        maxReviews: code.maxReviews,
+        isCompleted: code.isCompleted,
+      },
+    });
   } catch (error) {
+    if (error.code === 11000) {
+      // Duplicate key error - user already reviewed this code
+      return res.status(400).json({
+        error: "You have already reviewed this code",
+      });
+    }
     console.error("Error submitting review:", error);
     res.status(500).json({ error: "Failed to submit review" });
   }
@@ -192,12 +286,14 @@ app.get("/api/stats", async (req, res) => {
     const completedCodes = await Code.countDocuments({ isCompleted: true });
     const pendingCodes = await Code.countDocuments({ isCompleted: false });
     const totalReviews = await Review.countDocuments();
+    const uniqueReviewers = await Review.distinct("reviewerEmail");
 
     res.json({
       totalCodes,
       completedCodes,
       pendingCodes,
       totalReviews,
+      uniqueReviewers: uniqueReviewers.length,
     });
   } catch (error) {
     console.error("Error fetching stats:", error);
@@ -205,17 +301,46 @@ app.get("/api/stats", async (req, res) => {
   }
 });
 
-// Admin routes for managing codes
+// Check if user can review a specific code
+app.get("/api/codes/:id/can-review", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { email } = req.query;
 
-// Add a new code (for adding your extracted codes)
+    if (!email) {
+      return res.status(400).json({ error: "Email parameter is required" });
+    }
+
+    const code = await Code.findById(id);
+    if (!code) {
+      return res.status(404).json({ error: "Code not found" });
+    }
+
+    const canReview = !code.isCompleted && !code.reviewedBy.includes(email);
+
+    res.json({
+      canReview,
+      isCompleted: code.isCompleted,
+      alreadyReviewed: code.reviewedBy.includes(email),
+      reviewCount: code.reviewCount,
+      maxReviews: code.maxReviews,
+    });
+  } catch (error) {
+    console.error("Error checking review eligibility:", error);
+    res.status(500).json({ error: "Failed to check review eligibility" });
+  }
+});
+
+// Admin routes for managing codes
+// Add a new code
 app.post("/api/codes", async (req, res) => {
   try {
     const { title, code, language, maxReviews } = req.body;
 
     if (!title || !code || !language) {
-      return res
-        .status(400)
-        .json({ error: "Title, code, and language are required" });
+      return res.status(400).json({
+        error: "Title, code, and language are required",
+      });
     }
 
     const newCode = new Code({
@@ -226,7 +351,10 @@ app.post("/api/codes", async (req, res) => {
     });
 
     await newCode.save();
-    res.status(201).json({ message: "Code added successfully", code: newCode });
+    res.status(201).json({
+      message: "Code added successfully",
+      code: newCode,
+    });
   } catch (error) {
     console.error("Error adding code:", error);
     res.status(500).json({ error: "Failed to add code" });
@@ -292,34 +420,55 @@ app.get("/api/reviews", async (req, res) => {
   }
 });
 
-// Export reviews as CSV (for your thesis data)
+// Export reviews as CSV
 app.get("/api/reviews/export", async (req, res) => {
   try {
     const reviews = await Review.find()
       .populate("codeId", "title language code")
       .sort({ createdAt: -1 });
 
-    // Create CSV content
+    // Create CSV content with line reviews
     const csvHeader =
-      "Code Title,Code Language,Code Content,Reviewer Name,Years of Experience,Position,Review Category,Review Comment,Review Date\n";
-    const csvRows = reviews
-      .map((review) => {
-        const codeContent = review.codeId.code
-          .replace(/"/g, '""')
-          .replace(/\n/g, " ");
-        const reviewComment = review.reviewComment.replace(/"/g, '""');
+      "Code Title,Code Language,Code Content,Reviewer Name,Reviewer Email,Years of Experience,Position,General Comment,Line Number,Line Comment,Line Category,Review Date\n";
 
-        return `"${review.codeId.title}","${
-          review.codeId.language
-        }","${codeContent}","${review.reviewerName}",${
-          review.yearsOfExperience
-        },"${review.position}","${
-          review.category
-        }","${reviewComment}","${review.createdAt.toISOString()}"`;
-      })
-      .join("\n");
+    const csvRows = [];
 
-    const csvContent = csvHeader + csvRows;
+    reviews.forEach((review) => {
+      const codeContent = review.codeId.code
+        .replace(/"/g, '""')
+        .replace(/\n/g, " ");
+      const generalComment = (review.generalComment || "").replace(/"/g, '""');
+
+      if (review.lineReviews && review.lineReviews.length > 0) {
+        review.lineReviews.forEach((lineReview) => {
+          const lineComment = lineReview.comment.replace(/"/g, '""');
+          csvRows.push(
+            `"${review.codeId.title}","${
+              review.codeId.language
+            }","${codeContent}","${review.reviewerName}","${
+              review.reviewerEmail
+            }",${review.yearsOfExperience},"${
+              review.position
+            }","${generalComment}",${lineReview.lineNumber},"${lineComment}","${
+              lineReview.category
+            }","${review.createdAt.toISOString()}"`
+          );
+        });
+      } else {
+        // If no line reviews, still add a row
+        csvRows.push(
+          `"${review.codeId.title}","${
+            review.codeId.language
+          }","${codeContent}","${review.reviewerName}","${
+            review.reviewerEmail
+          }",${review.yearsOfExperience},"${
+            review.position
+          }","${generalComment}","","","","${review.createdAt.toISOString()}"`
+        );
+      }
+    });
+
+    const csvContent = csvHeader + csvRows.join("\n");
 
     res.setHeader("Content-Type", "text/csv");
     res.setHeader(
